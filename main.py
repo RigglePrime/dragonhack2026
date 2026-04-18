@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import requests
 import typer
 import rasterio
 from rasterio.windows import Window
@@ -21,6 +23,10 @@ class MatchResult:
 
 
 app = typer.Typer(add_completion=False)
+
+ALPHAVANTAGE_URL = "https://www.alphavantage.co/query"
+VALID_DN_MIN = 0.0
+VALID_DN_MAX = 250.0
 
 
 class TerrainMap:
@@ -120,7 +126,14 @@ class TerrainMap:
             + v10 * fr * (1.0 - fc)
             + v11 * fr * fc
         )
-        return values.astype(np.float64)
+
+        dn_values = values.astype(np.float64)
+        if np.any(~np.isfinite(dn_values)):
+            return None
+        if np.any(dn_values < VALID_DN_MIN) or np.any(dn_values > VALID_DN_MAX):
+            return None
+
+        return dn_to_slope_degrees(dn_values)
 
 
 def load_profile(path: Path) -> np.ndarray:
@@ -141,6 +154,119 @@ def load_profile(path: Path) -> np.ndarray:
     return profile
 
 
+def dn_to_slope_degrees(dn_values: np.ndarray) -> np.ndarray:
+    # EUDEM: slope[degrees] = acos(DN / 250) * 180 / pi
+    dn_clamped = np.clip(dn_values / VALID_DN_MAX, -1.0, 1.0)
+    return np.degrees(np.arccos(dn_clamped))
+
+
+def load_alpha_vantage_api_key(env_file: Path) -> str:
+    for env_key in ("ALPHAVANTAGE_API_KEY", "ALPHA_VANTAGE_API_KEY", "API_KEY"):
+        env_value = os.getenv(env_key)
+        if env_value:
+            return env_value.strip()
+
+    if not env_file.exists():
+        raise ValueError(f"API key file not found: {env_file}")
+
+    values: dict[str, str] = {}
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, raw_value = stripped.split("=", 1)
+        values[key.strip()] = raw_value.strip().strip('"').strip("'")
+
+    for file_key in ("ALPHAVANTAGE_API_KEY", "ALPHA_VANTAGE_API_KEY", "API_KEY"):
+        if file_key in values and values[file_key]:
+            return values[file_key]
+
+    raise ValueError(
+        "No AlphaVantage API key found. Add ALPHAVANTAGE_API_KEY or API_KEY to .env."
+    )
+
+
+def _extract_stock_value(entry: dict[str, str], field: str) -> float:
+    suffix_by_field = {
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "adjusted_close": "adjusted close",
+        "volume": "volume",
+    }
+    if field not in suffix_by_field:
+        raise ValueError(f"Unsupported stock field: {field}")
+
+    wanted_suffix = suffix_by_field[field]
+    for key, value in entry.items():
+        if key.lower().endswith(wanted_suffix):
+            return float(value)
+
+    if field == "adjusted_close":
+        for key, value in entry.items():
+            if key.lower().endswith("close"):
+                return float(value)
+
+    raise ValueError(f"Field '{field}' is not available in AlphaVantage response entry.")
+
+
+def fetch_stock_profile(
+    symbol: str,
+    points: int,
+    field: str,
+    api_key: str,
+    base_url: str = ALPHAVANTAGE_URL,
+) -> np.ndarray:
+    field = field.lower().strip()
+    if points > 100:
+        raise ValueError(
+            "AlphaVantage free daily endpoint returns up to 100 points. Use --stock-points <= 100."
+        )
+
+    params = {
+        "function": "TIME_SERIES_DAILY",
+        "symbol": symbol,
+        "outputsize": "compact",
+        "apikey": api_key,
+    }
+    response = requests.get(base_url, params=params, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+
+    if "Error Message" in payload:
+        raise ValueError(f"AlphaVantage error: {payload['Error Message']}")
+    if "Information" in payload:
+        raise RuntimeError(f"AlphaVantage information message: {payload['Information']}")
+    if "Note" in payload:
+        raise RuntimeError(f"AlphaVantage rate-limit note: {payload['Note']}")
+
+    ts_key = None
+    for key in payload.keys():
+        if "Time Series" in key:
+            ts_key = key
+            break
+    if ts_key is None:
+        raise ValueError("Could not find Time Series data in AlphaVantage response.")
+
+    time_series = payload[ts_key]
+    if not isinstance(time_series, dict) or len(time_series) == 0:
+        raise ValueError("AlphaVantage returned empty time series.")
+
+    ordered_dates = sorted(time_series.keys())
+    samples = np.asarray(
+        [_extract_stock_value(time_series[date], field) for date in ordered_dates],
+        dtype=np.float64,
+    )
+
+    finite = samples[np.isfinite(samples)]
+    if finite.size < points:
+        raise ValueError(
+            f"Requested {points} points for {symbol}, but only {finite.size} valid points are available."
+        )
+    return finite[-points:]
+
+
 def normalized(arr: np.ndarray) -> Optional[np.ndarray]:
     mean = arr.mean()
     std = arr.std()
@@ -153,12 +279,8 @@ def tercom_score(
     profile: np.ndarray,
     terrain: np.ndarray,
     nodata_min: Optional[float],
-    nodata_value: Optional[float],
 ) -> float:
     if nodata_min is not None and np.any(terrain >= nodata_min):
-        return -2.0
-
-    if nodata_value is not None and np.any(np.isclose(terrain, nodata_value, atol=1e-6)):
         return -2.0
 
     pz = normalized(profile)
@@ -195,7 +317,6 @@ def evaluate_candidate(
         profile,
         line,
         nodata_min=nodata_min,
-        nodata_value=terrain_map.nodata,
     )
 
 
@@ -402,7 +523,7 @@ def run_self_test(
 @app.command()
 def main(
     map_path: Path = typer.Option(
-        Path("EUD_cp_slop/eudem_slop_3035_europe.tif"),
+        Path("eud_cp_slop/eudem_slop_3035_europe.tif"),
         "--map",
         help="Path to the GeoTIFF terrain map.",
     ),
@@ -410,6 +531,26 @@ def main(
         None,
         "--profile",
         help="CSV/TXT/NPY profile file (1D elevation samples).",
+    ),
+    stock_symbol: Optional[str] = typer.Option(
+        None,
+        "--stock-symbol",
+        help="Stock symbol (e.g., AAPL). If set, profile comes from AlphaVantage history.",
+    ),
+    stock_points: int = typer.Option(
+        90,
+        "--stock-points",
+        help="Number of historical stock points to use as the profile (max 100 on free AlphaVantage).",
+    ),
+    stock_field: str = typer.Option(
+        "close",
+        "--stock-field",
+        help="Stock field to use: open, high, low, close, adjusted_close, volume.",
+    ),
+    alpha_env_file: Path = typer.Option(
+        Path(".env"),
+        "--alpha-env-file",
+        help="Path to .env containing ALPHAVANTAGE_API_KEY or API_KEY.",
     ),
     spacing_m: float = typer.Option(
         25.0,
@@ -449,10 +590,10 @@ def main(
     nodata_min: Optional[float] = typer.Option(
         None,
         "--nodata-min",
-        help="Treat values >= this threshold as invalid (optional).",
+        help="Treat sampled slope values >= this threshold as invalid (optional).",
     ),
     seed: int = typer.Option(42, "--seed", help="Random seed for repeatability."),
-    show_top: int = typer.Option(5, "--show-top", help="How many ranked candidates to print."),
+    show_top: int = typer.Option(10, "--show-top", help="How many ranked candidates to print."),
     self_test: bool = typer.Option(
         False,
         "--self-test",
@@ -489,10 +630,27 @@ def main(
             )
             raise typer.Exit(code=code)
 
-        if profile is None:
-            raise typer.BadParameter("--profile is required unless --self-test is used.")
+        if profile is None and stock_symbol is None:
+            raise typer.BadParameter(
+                "Provide exactly one input source: either --profile or --stock-symbol."
+            )
+        if profile is not None and stock_symbol is not None:
+            raise typer.BadParameter("Use only one source: --profile or --stock-symbol, not both.")
 
-        profile_data = load_profile(profile)
+        if stock_symbol is not None:
+            api_key = load_alpha_vantage_api_key(alpha_env_file)
+            profile_data = fetch_stock_profile(
+                symbol=stock_symbol.upper(),
+                points=stock_points,
+                field=stock_field,
+                api_key=api_key,
+            )
+            typer.echo(
+                f"Loaded {profile_data.size} historical '{stock_field}' points for {stock_symbol.upper()} from AlphaVantage."
+            )
+        else:
+            profile_data = load_profile(profile)
+
         if heading_deg is not None:
             heading_values = np.asarray([heading_deg], dtype=np.float64)
         else:
@@ -516,8 +674,9 @@ def main(
             typer.echo("No valid candidate found.")
             raise typer.Exit(code=1)
 
-        typer.echo("Top TERCOM candidates")
-        for idx, match in enumerate(results[:show_top], start=1):
+        count_to_print = 10 if stock_symbol is not None else show_top
+        typer.echo("Top similar elevations on the map")
+        for idx, match in enumerate(results[:count_to_print], start=1):
             typer.echo(format_match(idx, match, terrain_map))
     finally:
         terrain_map.close()
