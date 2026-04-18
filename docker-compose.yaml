@@ -8,8 +8,6 @@ services:
       - TERRAIN_MAP_PATH=/data/eudem_slop_3035_europe.tif
     volumes:
       - ./backend/eud_cp_slop:/data:ro
-    ports:
-      - "8000:8000"
 
   frontend:
     build:
@@ -18,5 +16,13 @@ services:
       - BACKEND_URL=http://backend:8000
     depends_on:
       - backend
+
+  nginx:
+    image: nginx:alpine
+    depends_on:
+      - backend
+      - frontend
     ports:
-      - "8501:8501"
+      - "80:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
