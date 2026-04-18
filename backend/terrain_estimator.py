@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import heapq
+import json
 import math
-import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import requests
-import typer
 import rasterio
+import typer
+import yfinance as yf
 from rasterio.windows import Window
+
+VALID_DN_MIN = 0.0
+VALID_DN_MAX = 250.0
+
+app = typer.Typer(add_completion=False)
 
 
 @dataclass(frozen=True)
@@ -22,20 +27,28 @@ class MatchResult:
     heading_deg: float
 
 
-app = typer.Typer(add_completion=False)
+@dataclass(frozen=True)
+class CoordinateCandidate:
+    rank: int
+    score: float
+    row: float
+    col: float
+    heading_deg: float
+    projected_x: float
+    projected_y: float
+    lat: float
+    lon: float
+    route_latlon: list[tuple[float, float]]
 
-ALPHAVANTAGE_URL = "https://www.alphavantage.co/query"
-VALID_DN_MIN = 0.0
-VALID_DN_MAX = 250.0
+
+def dn_to_slope_degrees(dn_values: np.ndarray) -> np.ndarray:
+    # EUDEM formula: slope[degrees] = acos(DN / 250) * 180 / pi
+    scaled = np.clip(dn_values / VALID_DN_MAX, -1.0, 1.0)
+    return np.degrees(np.arccos(scaled))
 
 
 class TerrainMap:
     def __init__(self, tiff_path: Path) -> None:
-        if rasterio is None:
-            raise RuntimeError(
-                "Missing dependency: rasterio. Install with 'python -m pip install rasterio'."
-            )
-
         self.path = tiff_path
         self.dataset = rasterio.open(tiff_path)
 
@@ -43,12 +56,24 @@ class TerrainMap:
         self.height = self.dataset.height
         self.transform = self.dataset.transform
         self.epsg = self.dataset.crs.to_epsg() if self.dataset.crs is not None else None
-        self.nodata = self.dataset.nodata
 
         self.scale_x = abs(float(self.transform.a))
         self.scale_y = abs(float(self.transform.e))
         if self.scale_x <= 0.0 or self.scale_y <= 0.0:
             raise ValueError("Invalid GeoTIFF transform resolution.")
+
+        self._transformer = None
+        if self.epsg is not None:
+            try:
+                from pyproj import Transformer
+
+                self._transformer = Transformer.from_crs(
+                    f"EPSG:{self.epsg}",
+                    "EPSG:4326",
+                    always_xy=True,
+                )
+            except Exception:
+                self._transformer = None
 
     def close(self) -> None:
         self.dataset.close()
@@ -57,9 +82,36 @@ class TerrainMap:
         x, y = self.dataset.xy(row, col)
         return float(x), float(y)
 
-    def projected_to_pixel(self, x: float, y: float) -> tuple[float, float]:
-        row, col = self.dataset.index(x, y)
-        return float(row), float(col)
+    def projected_to_wgs84(self, x: float, y: float) -> Optional[tuple[float, float]]:
+        if self._transformer is None:
+            return None
+        lon, lat = self._transformer.transform(x, y)
+        return float(lat), float(lon)
+
+    def _line_offsets(
+        self,
+        center_row: float,
+        center_col: float,
+        heading_deg: float,
+        spacing_px: float,
+        n_samples: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        theta = math.radians(heading_deg)
+        dcol = math.sin(theta)
+        drow = -math.cos(theta)
+
+        offsets = (np.arange(n_samples, dtype=np.float64) - (n_samples - 1) / 2.0) * spacing_px
+        rows = center_row + offsets * drow
+        cols = center_col + offsets * dcol
+        return rows, cols
+
+    def _validate_bounds(self, rows: np.ndarray, cols: np.ndarray) -> bool:
+        return not (
+            rows.min() < 1
+            or cols.min() < 1
+            or rows.max() >= self.height - 2
+            or cols.max() >= self.width - 2
+        )
 
     def sample_line(
         self,
@@ -72,20 +124,8 @@ class TerrainMap:
         if n_samples < 2:
             return None
 
-        theta = math.radians(heading_deg)
-        dcol = math.sin(theta)
-        drow = -math.cos(theta)
-
-        offsets = (np.arange(n_samples, dtype=np.float64) - (n_samples - 1) / 2.0) * spacing_px
-        rows = center_row + offsets * drow
-        cols = center_col + offsets * dcol
-
-        if (
-            rows.min() < 1
-            or cols.min() < 1
-            or rows.max() >= self.height - 2
-            or cols.max() >= self.width - 2
-        ):
+        rows, cols = self._line_offsets(center_row, center_col, heading_deg, spacing_px, n_samples)
+        if not self._validate_bounds(rows, cols):
             return None
 
         row0 = np.floor(rows).astype(np.int64)
@@ -98,7 +138,6 @@ class TerrainMap:
         left = int(col0.min())
         right = int(col1.max())
 
-        # Windowed read keeps memory bounded to only the needed patch.
         window = Window(
             col_off=left,
             row_off=top,
@@ -120,14 +159,13 @@ class TerrainMap:
         v10 = patch[local_r1, local_c0]
         v11 = patch[local_r1, local_c1]
 
-        values = (
+        dn_values = (
             v00 * (1.0 - fr) * (1.0 - fc)
             + v01 * (1.0 - fr) * fc
             + v10 * fr * (1.0 - fc)
             + v11 * fr * fc
-        )
+        ).astype(np.float64)
 
-        dn_values = values.astype(np.float64)
         if np.any(~np.isfinite(dn_values)):
             return None
         if np.any(dn_values < VALID_DN_MIN) or np.any(dn_values > VALID_DN_MAX):
@@ -135,136 +173,25 @@ class TerrainMap:
 
         return dn_to_slope_degrees(dn_values)
 
+    def route_latlon(
+        self,
+        center_row: float,
+        center_col: float,
+        heading_deg: float,
+        spacing_px: float,
+        n_points: int,
+    ) -> list[tuple[float, float]]:
+        rows, cols = self._line_offsets(center_row, center_col, heading_deg, spacing_px, n_points)
+        if not self._validate_bounds(rows, cols):
+            return []
 
-def load_profile(path: Path) -> np.ndarray:
-    if path.suffix.lower() == ".npy":
-        profile = np.asarray(np.load(path), dtype=np.float64).reshape(-1)
-    else:
-        data = np.genfromtxt(path, delimiter=",", dtype=np.float64)
-        if data.ndim == 0:
-            profile = np.asarray([float(data)], dtype=np.float64)
-        elif data.ndim == 1:
-            profile = data.astype(np.float64)
-        else:
-            profile = data[:, -1].astype(np.float64)
-
-    profile = profile[np.isfinite(profile)]
-    if profile.size < 8:
-        raise ValueError("Profile must contain at least 8 valid samples.")
-    return profile
-
-
-def dn_to_slope_degrees(dn_values: np.ndarray) -> np.ndarray:
-    # EUDEM: slope[degrees] = acos(DN / 250) * 180 / pi
-    dn_clamped = np.clip(dn_values / VALID_DN_MAX, -1.0, 1.0)
-    return np.degrees(np.arccos(dn_clamped))
-
-
-def load_alpha_vantage_api_key(env_file: Path) -> str:
-    for env_key in ("ALPHAVANTAGE_API_KEY", "ALPHA_VANTAGE_API_KEY", "API_KEY"):
-        env_value = os.getenv(env_key)
-        if env_value:
-            return env_value.strip()
-
-    if not env_file.exists():
-        raise ValueError(f"API key file not found: {env_file}")
-
-    values: dict[str, str] = {}
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, raw_value = stripped.split("=", 1)
-        values[key.strip()] = raw_value.strip().strip('"').strip("'")
-
-    for file_key in ("ALPHAVANTAGE_API_KEY", "ALPHA_VANTAGE_API_KEY", "API_KEY"):
-        if file_key in values and values[file_key]:
-            return values[file_key]
-
-    raise ValueError(
-        "No AlphaVantage API key found. Add ALPHAVANTAGE_API_KEY or API_KEY to .env."
-    )
-
-
-def _extract_stock_value(entry: dict[str, str], field: str) -> float:
-    suffix_by_field = {
-        "open": "open",
-        "high": "high",
-        "low": "low",
-        "close": "close",
-        "adjusted_close": "adjusted close",
-        "volume": "volume",
-    }
-    if field not in suffix_by_field:
-        raise ValueError(f"Unsupported stock field: {field}")
-
-    wanted_suffix = suffix_by_field[field]
-    for key, value in entry.items():
-        if key.lower().endswith(wanted_suffix):
-            return float(value)
-
-    if field == "adjusted_close":
-        for key, value in entry.items():
-            if key.lower().endswith("close"):
-                return float(value)
-
-    raise ValueError(f"Field '{field}' is not available in AlphaVantage response entry.")
-
-
-def fetch_stock_profile(
-    symbol: str,
-    points: int,
-    field: str,
-    api_key: str,
-    base_url: str = ALPHAVANTAGE_URL,
-) -> np.ndarray:
-    field = field.lower().strip()
-    if points > 100:
-        raise ValueError(
-            "AlphaVantage free daily endpoint returns up to 100 points. Use --stock-points <= 100."
-        )
-
-    params = {
-        "function": "TIME_SERIES_DAILY",
-        "symbol": symbol,
-        "outputsize": "compact",
-        "apikey": api_key,
-    }
-    response = requests.get(base_url, params=params, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
-
-    if "Error Message" in payload:
-        raise ValueError(f"AlphaVantage error: {payload['Error Message']}")
-    if "Information" in payload:
-        raise RuntimeError(f"AlphaVantage information message: {payload['Information']}")
-    if "Note" in payload:
-        raise RuntimeError(f"AlphaVantage rate-limit note: {payload['Note']}")
-
-    ts_key = None
-    for key in payload.keys():
-        if "Time Series" in key:
-            ts_key = key
-            break
-    if ts_key is None:
-        raise ValueError("Could not find Time Series data in AlphaVantage response.")
-
-    time_series = payload[ts_key]
-    if not isinstance(time_series, dict) or len(time_series) == 0:
-        raise ValueError("AlphaVantage returned empty time series.")
-
-    ordered_dates = sorted(time_series.keys())
-    samples = np.asarray(
-        [_extract_stock_value(time_series[date], field) for date in ordered_dates],
-        dtype=np.float64,
-    )
-
-    finite = samples[np.isfinite(samples)]
-    if finite.size < points:
-        raise ValueError(
-            f"Requested {points} points for {symbol}, but only {finite.size} valid points are available."
-        )
-    return finite[-points:]
+        route: list[tuple[float, float]] = []
+        for row, col in zip(rows, cols):
+            x, y = self.pixel_to_projected(float(row), float(col))
+            latlon = self.projected_to_wgs84(x, y)
+            if latlon is not None:
+                route.append(latlon)
+        return route
 
 
 def normalized(arr: np.ndarray) -> Optional[np.ndarray]:
@@ -275,14 +202,7 @@ def normalized(arr: np.ndarray) -> Optional[np.ndarray]:
     return (arr - mean) / std
 
 
-def tercom_score(
-    profile: np.ndarray,
-    terrain: np.ndarray,
-    nodata_min: Optional[float],
-) -> float:
-    if nodata_min is not None and np.any(terrain >= nodata_min):
-        return -2.0
-
+def tercom_score(profile: np.ndarray, terrain: np.ndarray) -> float:
     pz = normalized(profile)
     tz = normalized(terrain)
     if pz is None or tz is None:
@@ -308,16 +228,11 @@ def evaluate_candidate(
     col: float,
     heading_deg: float,
     spacing_px: float,
-    nodata_min: Optional[float],
 ) -> float:
     line = terrain_map.sample_line(row, col, heading_deg, spacing_px, profile.size)
     if line is None:
         return -2.0
-    return tercom_score(
-        profile,
-        line,
-        nodata_min=nodata_min,
-    )
+    return tercom_score(profile, line)
 
 
 def search_tercom(
@@ -329,7 +244,6 @@ def search_tercom(
     top_k: int,
     refine_iters: int,
     refine_step_px: float,
-    nodata_min: Optional[float],
     rng: np.random.Generator,
 ) -> list[MatchResult]:
     spacing_px = spacing_m / terrain_map.scale_x
@@ -358,7 +272,6 @@ def search_tercom(
                 col,
                 float(heading),
                 spacing_px,
-                nodata_min,
             )
             if len(heap) < top_k:
                 heapq.heappush(heap, (score, row, col, float(heading)))
@@ -391,7 +304,6 @@ def search_tercom(
                             cc,
                             hh,
                             spacing_px,
-                            nodata_min,
                         )
                         candidates.append((s, rr, cc, hh))
 
@@ -426,260 +338,149 @@ def search_tercom(
     return deduped
 
 
-def projected_to_wgs84(x: float, y: float, src_epsg: Optional[int]) -> Optional[tuple[float, float]]:
-    if src_epsg is None:
-        return None
-    try:
-        from pyproj import Transformer
+def estimate_candidates(
+    profile: np.ndarray,
+    map_path: Path,
+    top_n: int = 10,
+    spacing_m: float = 25.0,
+    headings: int = 12,
+    random_samples: int = 300,
+    top_k: int = 20,
+    refine_iters: int = 2,
+    refine_step_px: float = 120.0,
+    seed: int = 42,
+) -> list[CoordinateCandidate]:
+    clean_profile = np.asarray(profile, dtype=np.float64)
+    clean_profile = clean_profile[np.isfinite(clean_profile)]
+    if clean_profile.size < 8:
+        raise ValueError("Profile must contain at least 8 valid points.")
 
-        transformer = Transformer.from_crs(f"EPSG:{src_epsg}", "EPSG:4326", always_xy=True)
-        lon, lat = transformer.transform(x, y)
-        return float(lat), float(lon)
-    except Exception:
-        return None
-
-
-def format_match(rank: int, match: MatchResult, terrain_map: TerrainMap) -> str:
-    x, y = terrain_map.pixel_to_projected(match.row, match.col)
-    latlon = projected_to_wgs84(x, y, terrain_map.epsg)
-    base = (
-        f"#{rank} score={match.score:.5f} pixel(row={match.row:.1f}, col={match.col:.1f}) "
-        f"heading={match.heading_deg:.2f}deg projected=({x:.2f}, {y:.2f})"
-    )
-    if latlon is None:
-        return base
-    lat, lon = latlon
-    return f"{base} lat={lat:.6f} lon={lon:.6f}"
-
-
-def run_self_test(
-    terrain_map: TerrainMap,
-    spacing_m: float,
-    heading_deg: Optional[float],
-    headings: int,
-    samples: int,
-    topk: int,
-    refine_iters: int,
-    refine_step_px: float,
-    nodata_min: Optional[float],
-    seed: int,
-    self_test_points: int,
-    self_test_noise: float,
-) -> int:
+    headings_deg = np.linspace(0.0, 360.0, headings, endpoint=False)
     rng = np.random.default_rng(seed)
-    spacing_px = spacing_m / terrain_map.scale_x
-    half_extent = int(math.ceil((self_test_points - 1) * spacing_px / 2.0)) + 10
 
-    true_row = float(rng.integers(half_extent, terrain_map.height - half_extent))
-    true_col = float(rng.integers(half_extent, terrain_map.width - half_extent))
-    true_heading = float(rng.uniform(0.0, 360.0))
-
-    clean = terrain_map.sample_line(
-        true_row,
-        true_col,
-        true_heading,
-        spacing_px,
-        self_test_points,
-    )
-    if clean is None:
-        typer.echo("Self-test failed to generate synthetic profile.")
-        return 2
-
-    noisy = clean + rng.normal(0.0, self_test_noise, size=clean.shape)
-    headings = (
-        np.array([true_heading])
-        if heading_deg is not None
-        else np.linspace(0, 360, headings, endpoint=False)
-    )
-    results = search_tercom(
-        terrain_map=terrain_map,
-        profile=noisy,
-        spacing_m=spacing_m,
-        headings_deg=headings,
-        random_samples=samples,
-        top_k=topk,
-        refine_iters=refine_iters,
-        refine_step_px=refine_step_px,
-        nodata_min=nodata_min,
-        rng=rng,
-    )
-
-    if not results:
-        typer.echo("No match candidates found.")
-        return 3
-
-    best = results[0]
-    pixel_error = math.hypot(best.row - true_row, best.col - true_col)
-    meter_error = pixel_error * terrain_map.scale_x
-    heading_error = abs(((best.heading_deg - true_heading + 180.0) % 360.0) - 180.0)
-
-    typer.echo("TERCOM self-test")
-    typer.echo(f"true:  row={true_row:.2f} col={true_col:.2f} heading={true_heading:.2f}deg")
-    typer.echo(f"best:  {format_match(1, best, terrain_map)}")
-    typer.echo(f"error: pixels={pixel_error:.2f} meters={meter_error:.2f} heading_deg={heading_error:.2f}")
-    return 0
-
-
-@app.command()
-def main(
-    map_path: Path = typer.Option(
-        Path("eud_cp_slop/eudem_slop_3035_europe.tif"),
-        "--map",
-        help="Path to the GeoTIFF terrain map.",
-    ),
-    profile: Optional[Path] = typer.Option(
-        None,
-        "--profile",
-        help="CSV/TXT/NPY profile file (1D elevation samples).",
-    ),
-    stock_symbol: Optional[str] = typer.Option(
-        None,
-        "--stock-symbol",
-        help="Stock symbol (e.g., AAPL). If set, profile comes from AlphaVantage history.",
-    ),
-    stock_points: int = typer.Option(
-        90,
-        "--stock-points",
-        help="Number of historical stock points to use as the profile (max 100 on free AlphaVantage).",
-    ),
-    stock_field: str = typer.Option(
-        "close",
-        "--stock-field",
-        help="Stock field to use: open, high, low, close, adjusted_close, volume.",
-    ),
-    alpha_env_file: Path = typer.Option(
-        Path(".env"),
-        "--alpha-env-file",
-        help="Path to .env containing ALPHAVANTAGE_API_KEY or API_KEY.",
-    ),
-    spacing_m: float = typer.Option(
-        25.0,
-        "--spacing-m",
-        help="Distance in meters between consecutive profile samples.",
-    ),
-    heading_deg: Optional[float] = typer.Option(
-        None,
-        "--heading-deg",
-        help="Known heading in degrees (clockwise from north). If omitted, headings are searched.",
-    ),
-    headings: int = typer.Option(
-        36,
-        "--headings",
-        help="Number of headings to test when heading is unknown.",
-    ),
-    samples: int = typer.Option(
-        1200,
-        "--samples",
-        help="Number of random positions in the coarse search.",
-    ),
-    topk: int = typer.Option(
-        20,
-        "--topk",
-        help="Number of best coarse candidates kept for local refinement.",
-    ),
-    refine_iters: int = typer.Option(
-        4,
-        "--refine-iters",
-        help="Local refinement iterations per top candidate.",
-    ),
-    refine_step_px: float = typer.Option(
-        180.0,
-        "--refine-step-px",
-        help="Initial local refinement step in pixels.",
-    ),
-    nodata_min: Optional[float] = typer.Option(
-        None,
-        "--nodata-min",
-        help="Treat sampled slope values >= this threshold as invalid (optional).",
-    ),
-    seed: int = typer.Option(42, "--seed", help="Random seed for repeatability."),
-    show_top: int = typer.Option(10, "--show-top", help="How many ranked candidates to print."),
-    self_test: bool = typer.Option(
-        False,
-        "--self-test",
-        help="Run a synthetic TERCOM test by sampling a random known location.",
-    ),
-    self_test_points: int = typer.Option(
-        120,
-        "--self-test-points",
-        help="Number of points for synthetic profile generation.",
-    ),
-    self_test_noise: float = typer.Option(
-        3.0,
-        "--self-test-noise",
-        help="Gaussian noise sigma added in self-test mode.",
-    ),
-) -> None:
     terrain_map = TerrainMap(map_path)
-
     try:
-        if self_test:
-            code = run_self_test(
-                terrain_map=terrain_map,
-                spacing_m=spacing_m,
-                heading_deg=heading_deg,
-                headings=headings,
-                samples=samples,
-                topk=topk,
-                refine_iters=refine_iters,
-                refine_step_px=refine_step_px,
-                nodata_min=nodata_min,
-                seed=seed,
-                self_test_points=self_test_points,
-                self_test_noise=self_test_noise,
-            )
-            raise typer.Exit(code=code)
-
-        if profile is None and stock_symbol is None:
-            raise typer.BadParameter(
-                "Provide exactly one input source: either --profile or --stock-symbol."
-            )
-        if profile is not None and stock_symbol is not None:
-            raise typer.BadParameter("Use only one source: --profile or --stock-symbol, not both.")
-
-        if stock_symbol is not None:
-            api_key = load_alpha_vantage_api_key(alpha_env_file)
-            profile_data = fetch_stock_profile(
-                symbol=stock_symbol.upper(),
-                points=stock_points,
-                field=stock_field,
-                api_key=api_key,
-            )
-            typer.echo(
-                f"Loaded {profile_data.size} historical '{stock_field}' points for {stock_symbol.upper()} from AlphaVantage."
-            )
-        else:
-            profile_data = load_profile(profile)
-
-        if heading_deg is not None:
-            heading_values = np.asarray([heading_deg], dtype=np.float64)
-        else:
-            heading_values = np.linspace(0.0, 360.0, headings, endpoint=False)
-
-        rng = np.random.default_rng(seed)
-        results = search_tercom(
+        matches = search_tercom(
             terrain_map=terrain_map,
-            profile=profile_data,
+            profile=clean_profile,
             spacing_m=spacing_m,
-            headings_deg=heading_values,
-            random_samples=samples,
-            top_k=topk,
+            headings_deg=headings_deg,
+            random_samples=random_samples,
+            top_k=max(top_k, top_n),
             refine_iters=refine_iters,
             refine_step_px=refine_step_px,
-            nodata_min=nodata_min,
             rng=rng,
         )
 
-        if not results:
-            typer.echo("No valid candidate found.")
-            raise typer.Exit(code=1)
+        spacing_px = spacing_m / terrain_map.scale_x
+        candidates: list[CoordinateCandidate] = []
+        for rank, match in enumerate(matches[:top_n], start=1):
+            x, y = terrain_map.pixel_to_projected(match.row, match.col)
+            latlon = terrain_map.projected_to_wgs84(x, y)
+            if latlon is None:
+                continue
 
-        count_to_print = 10 if stock_symbol is not None else show_top
-        typer.echo("Top similar elevations on the map")
-        for idx, match in enumerate(results[:count_to_print], start=1):
-            typer.echo(format_match(idx, match, terrain_map))
+            lat, lon = latlon
+            route = terrain_map.route_latlon(
+                center_row=match.row,
+                center_col=match.col,
+                heading_deg=match.heading_deg,
+                spacing_px=spacing_px,
+                n_points=int(clean_profile.size),
+            )
+
+            candidates.append(
+                CoordinateCandidate(
+                    rank=rank,
+                    score=match.score,
+                    row=match.row,
+                    col=match.col,
+                    heading_deg=match.heading_deg,
+                    projected_x=x,
+                    projected_y=y,
+                    lat=lat,
+                    lon=lon,
+                    route_latlon=route,
+                )
+            )
+        return candidates
     finally:
         terrain_map.close()
+
+
+def fetch_stock_close_profile(symbol: str, window: str) -> np.ndarray:
+    config = {
+        "1d": {"period": "1d", "interval": "5m"},
+        "1w": {"period": "5d", "interval": "30m"},
+        "1mo": {"period": "1mo", "interval": "1d"},
+    }
+    if window not in config:
+        raise ValueError("window must be one of: 1d, 1w, 1mo")
+
+    history = yf.Ticker(symbol).history(
+        period=config[window]["period"],
+        interval=config[window]["interval"],
+        auto_adjust=False,
+    )
+    if history.empty:
+        raise ValueError(f"No Yahoo Finance data found for symbol '{symbol}'.")
+
+    closes = history["Close"].dropna().to_numpy(dtype=np.float64)
+    if closes.size < 8:
+        raise ValueError(f"Not enough close-price points for symbol '{symbol}'.")
+    return closes
+
+
+@app.command("estimate-stock")
+def estimate_stock_cli(
+    symbol: str = typer.Option(..., "--symbol", help="Ticker symbol, e.g. AAPL"),
+    window: str = typer.Option("1mo", "--window", help="History window: 1d, 1w, or 1mo."),
+    map_path: Path = typer.Option(
+        Path("eud_cp_slop/eudem_slop_3035_europe.tif"),
+        "--map",
+        help="Path to EUDEM GeoTIFF.",
+    ),
+    top_n: int = typer.Option(10, "--top-n", help="How many candidates to print."),
+    spacing_m: float = typer.Option(25.0, "--spacing-m"),
+    headings: int = typer.Option(12, "--headings"),
+    random_samples: int = typer.Option(300, "--samples"),
+    top_k: int = typer.Option(20, "--top-k"),
+    refine_iters: int = typer.Option(2, "--refine-iters"),
+    refine_step_px: float = typer.Option(120.0, "--refine-step-px"),
+    seed: int = typer.Option(42, "--seed"),
+    as_json: bool = typer.Option(False, "--json", help="Print JSON output."),
+) -> None:
+    profile = fetch_stock_close_profile(symbol=symbol.strip().upper(), window=window)
+    candidates = estimate_candidates(
+        profile=profile,
+        map_path=map_path,
+        top_n=top_n,
+        spacing_m=spacing_m,
+        headings=headings,
+        random_samples=random_samples,
+        top_k=top_k,
+        refine_iters=refine_iters,
+        refine_step_px=refine_step_px,
+        seed=seed,
+    )
+
+    if as_json:
+        payload: list[dict] = []
+        for candidate in candidates:
+            item = asdict(candidate)
+            item["route_latlon"] = [
+                {"lat": lat, "lon": lon} for lat, lon in candidate.route_latlon
+            ]
+            payload.append(item)
+        typer.echo(json.dumps(payload, indent=2))
+        return
+
+    typer.echo(f"Top {len(candidates)} candidates for {symbol.upper()} ({window})")
+    for candidate in candidates:
+        typer.echo(
+            f"#{candidate.rank} score={candidate.score:.4f} lat={candidate.lat:.6f} "
+            f"lon={candidate.lon:.6f} heading={candidate.heading_deg:.2f}"
+        )
 
 
 if __name__ == "__main__":

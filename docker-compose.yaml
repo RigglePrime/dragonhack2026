@@ -2,9 +2,21 @@ services:
   backend:
     build:
       context: ./backend
-  frontend:
-    image: nginx:alpine
-    ports:
-    - "80:80"
+    env_file:
+      - ./backend/.env
+    environment:
+      - TERRAIN_MAP_PATH=/data/eudem_slop_3035_europe.tif
     volumes:
-    - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./backend/eud_cp_slop:/data:ro
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      - BACKEND_URL=http://backend:8000
+    depends_on:
+      - backend
+    ports:
+      - "8501:8501"
