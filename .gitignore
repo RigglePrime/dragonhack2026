@@ -1,0 +1,8 @@
+.env
+*.zip
+__pycache__/
+*.py[codz]
+.venv/
+
+eud_cp_slop/
+DMV1000/
