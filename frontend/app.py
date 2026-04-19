@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 
 import folium
 import pandas as pd
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
+
+from logging_config import setup_logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
@@ -22,6 +29,7 @@ if "trigger_search" not in st.session_state:
     st.session_state.trigger_search = False
 
 def trigger_search():
+    logger.debug("frontend.trigger_search")
     st.session_state.trigger_search = True
 
 def _render_zoomed_out_map(zoomed_out: dict, selected_route: list[dict], selected_rank: int) -> folium.Map:
@@ -98,7 +106,10 @@ def _render_zoomed_out_map(zoomed_out: dict, selected_route: list[dict], selecte
         <span style="color: red;">●</span> Chosen<br>
     </div>
     """
-    fmap.get_root().html.add_child(folium.Element(legend_html))
+    root = fmap.get_root()
+    html_root = getattr(root, "html", None)
+    if html_root is not None:
+        html_root.add_child(folium.Element(legend_html))
 
     fmap.fit_bounds([
         [bounds["min_lat"], bounds["min_lon"]],
@@ -225,6 +236,7 @@ if run_now:
 
     symbol_clean = symbol.strip()
     if not symbol_clean:
+        logger.warning("frontend.run.missing_symbol")
         st.error("Please enter a stock identifier or company name.")
     else:
         payload = {
@@ -241,22 +253,44 @@ if run_now:
             payload["company"] = company_override.strip()
 
         try:
+            logger.info(
+                "frontend.analyze.start symbol=%s window=%s path_mode=%s",
+                symbol_clean,
+                window,
+                path_mode,
+            )
+            started = time.perf_counter()
             with st.spinner("Fetching stock data, estimating terrain, asking Gemini..."):
                 response = requests.post(
                     f"{BACKEND_URL}/api/analyze",
                     json=payload,
                     timeout=300,
                 )
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            logger.info(
+                "frontend.analyze.response status=%d elapsed_ms=%.1f",
+                response.status_code,
+                elapsed_ms,
+            )
             if response.status_code != 200:
+                logger.error("frontend.analyze.error status=%d body=%s", response.status_code, response.text)
                 st.error(f"Backend error {response.status_code}: {response.text}")
             else:
                 st.session_state.analysis_result = response.json()
+                logger.info("frontend.analyze.success")
         except Exception as exc:
+            logger.exception("frontend.analyze.exception")
             st.error(f"Request failed: {exc}")
 
 
 result = st.session_state.analysis_result
 if result:
+
+    logger.debug(
+        "frontend.render.result symbol=%s candidates=%d",
+        result.get("symbol", ""),
+        len(result.get("candidates", [])),
+    )
 
 
 

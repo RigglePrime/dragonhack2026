@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import logging
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -12,6 +13,11 @@ import rasterio
 import typer
 import yfinance as yf
 from rasterio.windows import Window
+
+from logging_config import setup_logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 VALID_DN_MIN = 0.0
 VALID_DN_MAX = 250.0
@@ -53,6 +59,7 @@ def dn_to_slope_degrees(dn_values: np.ndarray) -> np.ndarray:
 class TerrainMap:
     def __init__(self, tiff_path: Path) -> None:
         self.path = tiff_path
+        logger.info("terrain.map.open path=%s", tiff_path)
         self.dataset = rasterio.open(tiff_path)
 
         self.width = self.dataset.width
@@ -64,6 +71,14 @@ class TerrainMap:
         self.scale_y = abs(float(self.transform.e))
         if self.scale_x <= 0.0 or self.scale_y <= 0.0:
             raise ValueError("Invalid GeoTIFF transform resolution.")
+        logger.info(
+            "terrain.map.loaded width=%d height=%d epsg=%s scale_x=%.3f scale_y=%.3f",
+            self.width,
+            self.height,
+            self.epsg,
+            self.scale_x,
+            self.scale_y,
+        )
 
         self._transformer = None
         if self.epsg is not None:
@@ -79,6 +94,7 @@ class TerrainMap:
                 self._transformer = None
 
     def close(self) -> None:
+        logger.info("terrain.map.close path=%s", self.path)
         self.dataset.close()
 
     def pixel_to_projected(self, row: float, col: float) -> tuple[float, float]:
@@ -141,11 +157,9 @@ class TerrainMap:
         left = int(col0.min())
         right = int(col1.max())
 
-        window = Window(
-            col_off=left,
-            row_off=top,
-            width=(right - left + 1),
-            height=(bottom - top + 1),
+        window = Window.from_slices(
+            (top, bottom + 1),
+            (left, right + 1),
         )
         patch = self.dataset.read(1, window=window, out_dtype=np.float32)
 
@@ -263,6 +277,7 @@ def _astar_guided_route(
     right = min(terrain_map.width - 2, int(max(start_col, goal_col)) + corridor_pad)
 
     if bottom <= top + 2 or right <= left + 2:
+        logger.debug("terrain.astar.corridor_too_small")
         return None
 
     row_idx = np.arange(top, bottom + 1, dtype=np.float64)
@@ -270,6 +285,7 @@ def _astar_guided_route(
     grid_rows, grid_cols = np.meshgrid(row_idx, col_idx, indexing="ij")
     slope_patch = terrain_map.sample_points(grid_rows.ravel(), grid_cols.ravel())
     if slope_patch is None:
+        logger.debug("terrain.astar.no_slope_patch")
         return None
     slope_patch = slope_patch.reshape((row_idx.size, col_idx.size))
 
@@ -280,10 +296,13 @@ def _astar_guided_route(
     gr, gc = to_local(goal_row, goal_col)
 
     if sr < 0 or sc < 0 or gr < 0 or gc < 0:
+        logger.debug("terrain.astar.invalid_local_bounds")
         return None
     if sr >= slope_patch.shape[0] or sc >= slope_patch.shape[1]:
+        logger.debug("terrain.astar.start_out_of_patch")
         return None
     if gr >= slope_patch.shape[0] or gc >= slope_patch.shape[1]:
+        logger.debug("terrain.astar.goal_out_of_patch")
         return None
 
     neighbor_moves = [
@@ -347,6 +366,7 @@ def _astar_guided_route(
             heapq.heappush(open_heap, (g_new + h, g_new, nr, nc, next_steps))
 
     if goal_state is None:
+        logger.debug("terrain.astar.no_path iterations=%d", iterations)
         return None
 
     path_local: list[tuple[int, int]] = []
@@ -360,6 +380,7 @@ def _astar_guided_route(
     path_local.reverse()
     path_rows = np.asarray([top + r for r, _ in path_local], dtype=np.float64)
     path_cols = np.asarray([left + c for _, c in path_local], dtype=np.float64)
+    logger.debug("terrain.astar.path_found nodes=%d iterations=%d", len(path_local), iterations)
     return path_rows, path_cols
 
 
@@ -466,6 +487,15 @@ def search_tercom(
     selected_count = max(1, int(top_k))
     candidates: list[MatchResult] = []
 
+    logger.info(
+        "terrain.search.start mode=%s placed=%d keep=%d headings=%d spacing_m=%.2f",
+        path_mode,
+        placed_locations,
+        selected_count,
+        len(headings_deg),
+        spacing_m,
+    )
+
     row_low = half_extent
     row_high = terrain_map.height - half_extent
     col_low = half_extent
@@ -478,7 +508,7 @@ def search_tercom(
     # 2) run A* only on the best shortlist.
     eval_mode: PATH_MODE = "straight" if path_mode == "astar" else path_mode
 
-    for _ in range(placed_locations):
+    for idx in range(placed_locations):
         row = float(rng.integers(row_low, row_high))
         col = float(rng.integers(col_low, col_high))
 
@@ -507,10 +537,19 @@ def search_tercom(
         if best_local is not None and np.isfinite(best_local.distance):
             candidates.append(best_local)
 
+        if (idx + 1) % 25 == 0:
+            logger.debug(
+                "terrain.search.progress processed=%d/%d retained=%d",
+                idx + 1,
+                placed_locations,
+                len(candidates),
+            )
+
     candidates.sort(key=lambda item: item.distance)
     closest = candidates[:selected_count]
 
     if path_mode != "astar":
+        logger.info("terrain.search.done mode=straight results=%d", len(closest))
         return closest
 
     shortlist = candidates[: min(24, len(candidates))]
@@ -537,9 +576,11 @@ def search_tercom(
             )
 
     if not refined:
+        logger.warning("terrain.search.astar_refine_empty fallback_count=%d", len(closest))
         return closest
 
     refined.sort(key=lambda item: item.distance)
+    logger.info("terrain.search.done mode=astar results=%d", min(selected_count, len(refined)))
     return refined[:selected_count]
 
 
@@ -562,6 +603,14 @@ def estimate_candidates(
     clean_profile = clean_profile[np.isfinite(clean_profile)]
     if clean_profile.size < 8:
         raise ValueError("Profile must contain at least 8 valid points.")
+
+    logger.info(
+        "terrain.estimate.start mode=%s profile_points=%d top_n=%d spacing_m=%.2f",
+        path_mode,
+        clean_profile.size,
+        top_n,
+        spacing_m,
+    )
 
     headings_deg = np.linspace(0.0, 360.0, headings, endpoint=False)
     rng = np.random.default_rng(seed)
@@ -599,6 +648,7 @@ def estimate_candidates(
                 path_mode=path_mode,
             )
             if sampled is None and path_mode == "astar":
+                logger.debug("terrain.estimate.astar_reconstruct_fallback rank=%d", rank)
                 sampled = _candidate_path_profile(
                     terrain_map=terrain_map,
                     profile=clean_profile,
@@ -635,12 +685,14 @@ def estimate_candidates(
                     terrain_profile=terrain_profile.tolist(),
                 )
             )
+        logger.info("terrain.estimate.done candidates=%d", len(candidates))
         return candidates
     finally:
         terrain_map.close()
 
 
 def fetch_stock_close_profile(symbol: str, window: str) -> np.ndarray:
+    logger.info("terrain.cli.stock_fetch.start symbol=%s window=%s", symbol, window)
     config = {
         "1d": {"period": "1d", "interval": "5m"},
         "1w": {"period": "5d", "interval": "30m"},
@@ -660,6 +712,7 @@ def fetch_stock_close_profile(symbol: str, window: str) -> np.ndarray:
     closes = history["Close"].dropna().to_numpy(dtype=np.float64)
     if closes.size < 8:
         raise ValueError(f"Not enough close-price points for symbol '{symbol}'.")
+    logger.info("terrain.cli.stock_fetch.done symbol=%s points=%d", symbol, closes.size)
     return closes
 
 
@@ -683,6 +736,13 @@ def estimate_stock_cli(
     path_mode: PATH_MODE = typer.Option("straight", "--path-mode"),
     as_json: bool = typer.Option(False, "--json", help="Print JSON output."),
 ) -> None:
+    logger.info(
+        "terrain.cli.start symbol=%s window=%s mode=%s top_n=%d",
+        symbol,
+        window,
+        path_mode,
+        top_n,
+    )
     profile = fetch_stock_close_profile(symbol=symbol.strip().upper(), window=window)
     candidates = estimate_candidates(
         profile=profile,
@@ -705,6 +765,7 @@ def estimate_stock_cli(
             item["route_latlon"] = [{"lat": lat, "lon": lon} for lat, lon in candidate.route_latlon]
             payload.append(item)
         typer.echo(json.dumps(payload, indent=2))
+        logger.info("terrain.cli.done_json candidates=%d", len(payload))
         return
 
     typer.echo(f"Top {len(candidates)} candidates for {symbol.upper()} ({window}) [{path_mode}]")
@@ -713,6 +774,7 @@ def estimate_stock_cli(
             f"#{candidate.rank} score={candidate.score:.4f} lat={candidate.lat:.6f} "
             f"lon={candidate.lon:.6f} heading={candidate.heading_deg:.2f}"
         )
+    logger.info("terrain.cli.done candidates=%d", len(candidates))
 
 
 if __name__ == "__main__":

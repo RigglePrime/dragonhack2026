@@ -41,10 +41,15 @@ Create/update `backend/.env` with:
 
 - `GEMINI_API_KEY=...` for Gemini selection
 - `TERRAIN_MAP_PATH` is set by compose to `/data/eudem_slop_3035_europe.tif`
+- `APP_LOG_LEVEL=INFO` controls backend/service/estimator/gemini log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
+- `FRONTEND_LOG_LEVEL=INFO` controls Streamlit frontend log level (falls back to `APP_LOG_LEVEL`)
 
 Notes:
 - Yahoo Finance via `yfinance` does not require an API key.
 - The EUDEM GeoTIFF is mounted from `backend/eud_cp_slop/` into `/data` in the backend container.
+
+Logs include request lifecycle events, stock fetch timing, terrain search progress, Gemini parse/fallback behavior,
+and frontend request timing so you can trace a full analyze run end-to-end.
 
 ## Run With Docker Compose
 
