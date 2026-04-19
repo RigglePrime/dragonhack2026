@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import heapq
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -21,6 +20,7 @@ app = typer.Typer(add_completion=False)
 
 @dataclass(frozen=True)
 class MatchResult:
+    distance: float
     score: float
     row: float
     col: float
@@ -203,23 +203,23 @@ def normalized(arr: np.ndarray) -> Optional[np.ndarray]:
     return (arr - mean) / std
 
 
-def tercom_score(profile: np.ndarray, terrain: np.ndarray) -> float:
+def profile_distance(profile: np.ndarray, terrain: np.ndarray) -> float:
     pz = normalized(profile)
     tz = normalized(terrain)
     if pz is None or tz is None:
-        return -2.0
+        return float("inf")
 
-    corr = float(np.mean(pz * tz))
+    primary = float(np.linalg.norm(pz - tz) / math.sqrt(pz.size))
 
     pd = np.diff(profile)
     td = np.diff(terrain)
     pdz = normalized(pd)
     tdz = normalized(td)
     if pdz is None or tdz is None:
-        return corr
+        return primary
 
-    diff_corr = float(np.mean(pdz * tdz))
-    return 0.7 * corr + 0.3 * diff_corr
+    derivative = float(np.linalg.norm(pdz - tdz) / math.sqrt(pdz.size))
+    return 0.7 * primary + 0.3 * derivative
 
 
 def evaluate_candidate(
@@ -229,11 +229,18 @@ def evaluate_candidate(
     col: float,
     heading_deg: float,
     spacing_px: float,
-) -> float:
+) -> tuple[float, float]:
     line = terrain_map.sample_line(row, col, heading_deg, spacing_px, profile.size)
     if line is None:
-        return -2.0
-    return tercom_score(profile, line)
+        return float("inf"), -2.0
+
+    distance = profile_distance(profile, line)
+    if not np.isfinite(distance):
+        return float("inf"), -2.0
+
+    # Keep score for compatibility with current frontend/output format.
+    score = 1.0 / (1.0 + distance)
+    return distance, score
 
 
 def search_tercom(
@@ -247,6 +254,8 @@ def search_tercom(
     refine_step_px: float,
     rng: np.random.Generator,
 ) -> list[MatchResult]:
+    _ = refine_iters, refine_step_px  # Kept for API compatibility; current algorithm is single-pass.
+
     spacing_px = spacing_m / terrain_map.scale_x
     if spacing_px <= 0:
         raise ValueError("spacing_m must be positive.")
@@ -255,18 +264,22 @@ def search_tercom(
     if half_extent * 2 >= min(terrain_map.width, terrain_map.height):
         raise ValueError("Profile extent is too large for this map.")
 
-    heap: list[tuple[float, float, float, float]] = []
+    placed_locations = max(1, int(random_samples))
+    selected_count = max(1, int(top_k))
+    candidates: list[MatchResult] = []
 
     row_low = half_extent
     row_high = terrain_map.height - half_extent
     col_low = half_extent
     col_high = terrain_map.width - half_extent
 
-    for _ in range(random_samples):
+    for _ in range(placed_locations):
         row = float(rng.integers(row_low, row_high))
         col = float(rng.integers(col_low, col_high))
+
+        best_local: Optional[MatchResult] = None
         for heading in headings_deg:
-            score = evaluate_candidate(
+            distance, score = evaluate_candidate(
                 terrain_map,
                 profile,
                 row,
@@ -274,69 +287,24 @@ def search_tercom(
                 float(heading),
                 spacing_px,
             )
-            if len(heap) < top_k:
-                heapq.heappush(heap, (score, row, col, float(heading)))
-            elif score > heap[0][0]:
-                heapq.heapreplace(heap, (score, row, col, float(heading)))
 
-    best = sorted(heap, key=lambda x: x[0], reverse=True)
-
-    refined: list[MatchResult] = []
-    for score, row, col, heading in best:
-        cur_score = score
-        cur_row = row
-        cur_col = col
-        cur_heading = heading
-
-        step = refine_step_px
-        heading_step = 8.0
-        for _ in range(refine_iters):
-            candidates: list[tuple[float, float, float, float]] = []
-            for dr in (-step, 0.0, step):
-                for dc in (-step, 0.0, step):
-                    for dh in (-heading_step, 0.0, heading_step):
-                        rr = cur_row + dr
-                        cc = cur_col + dc
-                        hh = (cur_heading + dh) % 360.0
-                        s = evaluate_candidate(
-                            terrain_map,
-                            profile,
-                            rr,
-                            cc,
-                            hh,
-                            spacing_px,
-                        )
-                        candidates.append((s, rr, cc, hh))
-
-            best_local = max(candidates, key=lambda x: x[0])
-            if best_local[0] >= cur_score:
-                cur_score, cur_row, cur_col, cur_heading = best_local
-
-            step = max(1.0, step / 2.0)
-            heading_step = max(0.5, heading_step / 2.0)
-
-        refined.append(
-            MatchResult(
-                score=cur_score,
-                row=cur_row,
-                col=cur_col,
-                heading_deg=cur_heading,
+            current = MatchResult(
+                distance=distance,
+                score=score,
+                row=row,
+                col=col,
+                heading_deg=float(heading),
             )
-        )
+            if best_local is None or current.distance < best_local.distance:
+                best_local = current
 
-    refined.sort(key=lambda m: m.score, reverse=True)
-    deduped: list[MatchResult] = []
-    for item in refined:
-        keep = True
-        for existing in deduped:
-            dist = math.hypot(item.row - existing.row, item.col - existing.col)
-            heading_delta = abs(((item.heading_deg - existing.heading_deg + 180.0) % 360.0) - 180.0)
-            if dist < 8.0 and heading_delta < 1.0:
-                keep = False
-                break
-        if keep:
-            deduped.append(item)
-    return deduped
+        if best_local is not None and np.isfinite(best_local.distance):
+            candidates.append(best_local)
+
+    candidates.sort(key=lambda item: item.distance)
+    closest = candidates[:selected_count]
+
+    return closest
 
 
 def estimate_candidates(
@@ -351,6 +319,8 @@ def estimate_candidates(
     refine_step_px: float = 120.0,
     seed: int = 42,
 ) -> list[CoordinateCandidate]:
+    _ = random_samples, top_k  # Kept for compatibility with existing service/frontend payload.
+
     clean_profile = np.asarray(profile, dtype=np.float64)
     clean_profile = clean_profile[np.isfinite(clean_profile)]
     if clean_profile.size < 8:
@@ -359,6 +329,10 @@ def estimate_candidates(
     headings_deg = np.linspace(0.0, 360.0, headings, endpoint=False)
     rng = np.random.default_rng(seed)
 
+    # Requested behavior: place 100 locations and keep the 10 closest.
+    placed_locations = 100
+    selected_count = min(max(1, int(top_n)), 10)
+
     terrain_map = TerrainMap(map_path)
     try:
         matches = search_tercom(
@@ -366,8 +340,8 @@ def estimate_candidates(
             profile=clean_profile,
             spacing_m=spacing_m,
             headings_deg=headings_deg,
-            random_samples=random_samples,
-            top_k=max(top_k, top_n),
+            random_samples=placed_locations,
+            top_k=max(selected_count, 10),
             refine_iters=refine_iters,
             refine_step_px=refine_step_px,
             rng=rng,
@@ -375,7 +349,7 @@ def estimate_candidates(
 
         spacing_px = spacing_m / terrain_map.scale_x
         candidates: list[CoordinateCandidate] = []
-        for rank, match in enumerate(matches[:top_n], start=1):
+        for rank, match in enumerate(matches[:selected_count], start=1):
             x, y = terrain_map.pixel_to_projected(match.row, match.col)
             latlon = terrain_map.projected_to_wgs84(x, y)
             if latlon is None:

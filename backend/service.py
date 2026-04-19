@@ -30,8 +30,8 @@ class AnalyzeRequest(BaseModel):
     )
     spacing_m: float = 100.0
     headings: int = 12
-    random_samples: int = 300
-    top_k: int = 20
+    random_samples: int = 500
+    top_k: int = 10
     refine_iters: int = 2
     refine_step_px: float = 120.0
 

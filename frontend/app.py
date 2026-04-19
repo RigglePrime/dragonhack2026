@@ -207,8 +207,8 @@ company_override = st.text_input(
 with st.expander("Advanced matching options"):
     spacing_m = st.number_input("Spacing meters", min_value=1.0, value=100.0, step=1.0)
     headings = st.slider("Heading hypotheses", min_value=4, max_value=36, value=12)
-    random_samples = st.slider("Random samples", min_value=50, max_value=2000, value=300, step=50)
-    top_k = st.slider("Top-k coarse candidates", min_value=10, max_value=100, value=20, step=5)
+    random_samples = st.slider("Random samples", min_value=50, max_value=2000, value=500, step=50)
+    top_k = st.slider("Top-k coarse candidates", min_value=10, max_value=100, value=10, step=5)
     refine_iters = st.slider("Refine iterations", min_value=1, max_value=6, value=2)
 
 run_now = st.button("Analyze") or st.session_state.trigger_search
