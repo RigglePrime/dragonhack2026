@@ -39,6 +39,7 @@ class CoordinateCandidate:
     lat: float
     lon: float
     route_latlon: list[tuple[float, float]]
+    terrain_profile: list[float]
 
 
 def dn_to_slope_degrees(dn_values: np.ndarray) -> np.ndarray:
@@ -388,6 +389,7 @@ def estimate_candidates(
                 spacing_px=spacing_px,
                 n_points=int(clean_profile.size),
             )
+            terrain_profile=terrain_map.sample_line(match.row, match.col, match.heading_deg, spacing_px, clean_profile.size, )
 
             candidates.append(
                 CoordinateCandidate(
@@ -401,6 +403,7 @@ def estimate_candidates(
                     lat=lat,
                     lon=lon,
                     route_latlon=route,
+                    terrain_profile=terrain_profile.tolist() if terrain_profile is not None else [],
                 )
             )
         return candidates

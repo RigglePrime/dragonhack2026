@@ -8,6 +8,7 @@ import requests
 import streamlit as st
 from streamlit_folium import st_folium
 
+
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 st.set_page_config(page_title="Stock Terrain Vibes", layout="wide")
@@ -17,8 +18,13 @@ st.caption("Yahoo Finance -> Terrain Matching -> Gemini Pick -> OpenStreetMap")
 
 if "analysis_result" not in st.session_state:
     st.session_state.analysis_result = None
+if "trigger_search" not in st.session_state:
+    st.session_state.trigger_search = False
 
-def _render_zoomed_out_map(zoomed_out: dict, selected_route: list[dict], selected_rank: int | None) -> folium.Map:
+def trigger_search():
+    st.session_state.trigger_search = True
+
+def _render_zoomed_out_map(zoomed_out: dict, selected_route: list[dict], selected_rank: int) -> folium.Map:
     bounds = zoomed_out["bounds"]
     points = zoomed_out["points"]
 
@@ -27,11 +33,10 @@ def _render_zoomed_out_map(zoomed_out: dict, selected_route: list[dict], selecte
 
     fmap = folium.Map(location=[center_lat, center_lon], zoom_start=4, tiles="OpenStreetMap")
 
-    # --- 1. Draw all NON-selected points first ---
+    # --- Draw all points except chosen (red) and first (yellow) ---
     for p in points:
-        if p["rank"] == selected_rank:
-            continue  # skip selected for now
-
+        if p["rank"] in (selected_rank, 1):
+            continue
         folium.CircleMarker(
             location=[p["lat"], p["lon"]],
             radius=5,
@@ -41,29 +46,60 @@ def _render_zoomed_out_map(zoomed_out: dict, selected_route: list[dict], selecte
             popup=f"Rank {p['rank']}",
         ).add_to(fmap)
 
-    # --- 2. Draw the SELECTED point last (so it appears on top) ---
-    if selected_rank is not None:
-        selected = next((p for p in points if p["rank"] == selected_rank), None)
-        if selected:
-            folium.CircleMarker(
-                location=[selected["lat"], selected["lon"]],
-                radius=8,
-                color="red",
-                fill=True,
-                fill_opacity=1.0,
-                popup=f"Rank {selected['rank']} (chosen)",
-            ).add_to(fmap)
+    # --- Rank #1 in yellow ---
+    first = next((p for p in points if p["rank"] == 1), None)
+    if first:
+        folium.CircleMarker(
+            location=[first["lat"], first["lon"]],
+            radius=8,
+            color="yellow",
+            fill=True,
+            fill_opacity=1.0,
+            popup="Rank 1 (best score)",
+        ).add_to(fmap)
 
-    # --- 3. Highlight selected route (thin + subtle) ---
+    # --- Chosen candidate in red ---
+    chosen = next((p for p in points if p["rank"] == selected_rank), None)
+    if chosen:
+        folium.CircleMarker(
+            location=[chosen["lat"], chosen["lon"]],
+            radius=10,
+            color="red",
+            fill=True,
+            fill_opacity=1.0,
+            popup=f"Rank {selected_rank} (chosen)",
+        ).add_to(fmap)
+
+    # --- Chosen route in red ---
     if selected_route:
         folium.PolyLine(
             locations=[(p["lat"], p["lon"]) for p in selected_route],
             color="red",
-            weight=2,
-            opacity=0.6,
+            weight=3,
+            opacity=0.8,
         ).add_to(fmap)
 
-    # Fit bounds
+    # --- Legend ---
+    legend_html="""
+    <div style="
+        position: fixed;
+        bottom: 20px;
+        left: 20px;
+        z-index: 9999;
+        font-size: 12px;
+        color: black;
+        background-color: rgba(255, 255, 255, 0.0);  /* fully transparent */
+        padding: 4px 6px;
+        line-height: 1.2;
+    ">
+        <b style="color:black;">Legend</b><br>
+        <span style="color: blue;">●</span> Other<br>
+        <span style="color: yellow;">●</span> Rank #1<br>
+        <span style="color: red;">●</span> Chosen<br>
+    </div>
+    """
+    fmap.get_root().html.add_child(folium.Element(legend_html))
+
     fmap.fit_bounds([
         [bounds["min_lat"], bounds["min_lon"]],
         [bounds["max_lat"], bounds["max_lon"]],
@@ -153,7 +189,8 @@ def _render_map(candidates: list[dict], selected_candidate: dict | None, route: 
 
 left, right = st.columns([2, 1])
 with left:
-    symbol = st.text_input("Stock market identifier", placeholder="AAPL")
+    symbol=st.text_input("Stock market identifier", placeholder="AAPL or Tesla or Apple", key="symbol_input", on_change=trigger_search)
+
 with right:
     window = st.selectbox(
         "History window",
@@ -174,10 +211,14 @@ with st.expander("Advanced matching options"):
     top_k = st.slider("Top-k coarse candidates", min_value=10, max_value=100, value=20, step=5)
     refine_iters = st.slider("Refine iterations", min_value=1, max_value=6, value=2)
 
-if st.button("Analyze"):
-    symbol_clean = symbol.strip().upper()
+run_now = st.button("Analyze") or st.session_state.trigger_search
+
+if run_now:
+    st.session_state.trigger_search = False  # reset flag
+
+    symbol_clean = symbol.strip()
     if not symbol_clean:
-        st.error("Please enter a stock identifier.")
+        st.error("Please enter a stock identifier or company name.")
     else:
         payload = {
             "symbol": symbol_clean,
@@ -205,22 +246,11 @@ if st.button("Analyze"):
         except Exception as exc:
             st.error(f"Request failed: {exc}")
 
+
 result = st.session_state.analysis_result
 if result:
-    st.subheader(f"Symbol: {result['symbol']} ({result['window']})")
-    series_df = pd.DataFrame(result["series"])
-    if not series_df.empty:
-        series_df["time"] = pd.to_datetime(series_df["time"])
-        series_df = series_df.sort_values("time")
-        df = series_df.set_index("time")
 
-        close = df["close"]
 
-        # Min–max normalization
-        normalized = (close - close.min()) / (close.max() - close.min())
-
-        st.line_chart(normalized, use_container_width=True)
-        #st.line_chart(series_df.set_index("time")["close"], use_container_width=True)
 
     gemini = result.get("gemini", {})
     st.markdown("### Gemini pick")
@@ -230,6 +260,12 @@ if result:
     candidates = result.get("candidates", [])
     selected = result.get("selected_candidate")
     route = result.get("route", [])
+    terrain_profile=result.get("terrain_profile", [])
+    # Min–max normalize terrain profile
+    terrain_norm=None
+    if terrain_profile:
+        terrain_arr=pd.Series(terrain_profile, dtype=float)
+        terrain_norm=(terrain_arr-terrain_arr.min())/(terrain_arr.max()-terrain_arr.min())
 
     st.markdown("### Maps")
 
@@ -240,7 +276,7 @@ if result:
     with col1:
         st.markdown("#### 🌍 Zoomed‑out (all candidates + highlighted route)")
         if "zoomed_out" in maps:
-            selected_rank=selected["rank"] if selected else None
+            selected_rank=selected["rank"]
             fmap_out=_render_zoomed_out_map(maps["zoomed_out"], route, selected_rank)
 
             st_folium(fmap_out, width=600, height=500)
@@ -254,9 +290,52 @@ if result:
             st_folium(fmap_in, width=600, height=500)
         else:
             st.info("Zoomed‑in map not available.")
+    st.subheader(f"Symbol: {result['symbol']} ({result['window']})")
+    series_df=pd.DataFrame(result["series"])
+    if not series_df.empty:
+        series_df["time"] = pd.to_datetime(series_df["time"])
+        series_df = series_df.sort_values("time")
+        df = series_df.set_index("time")
+
+        close = df["close"]
+
+        # Min–max normalization
+        normalized = (close - close.min()) / (close.max() - close.min())
+
+        st.line_chart(normalized, use_container_width=True)
+        #st.line_chart(series_df.set_index("time")["close"], use_container_width=True)
+    if terrain_profile:
+        st.markdown("### Terrain Height Profile (Slope Degrees)")
+        profile_df=pd.DataFrame({"index":list(range(len(terrain_norm))), "terrain_norm":terrain_norm}).set_index("index")
+
+        st.line_chart(profile_df, use_container_width=True)
+
+    import altair as alt
+
+    if candidates:
+        st.markdown("### All Terrain Profiles (Chosen in Red, Rank #1 in Yellow)")
+
+        chosen_rank=selected["rank"]
+        first_rank=1
+
+        rows=[]
+        for c in candidates:
+            profile=c.get("terrain_profile", [])
+            for i, v in enumerate(profile):
+                rows.append({"index":i, "value":v, "rank":str(c["rank"]), "color_group":("chosen" if c["rank"]==chosen_rank else "first" if c["rank"]==first_rank else "other")})
+
+        df_all=pd.DataFrame(rows)
+
+        # Color mapping
+        color_scale=alt.Scale(domain=["chosen", "first", "other"], range=["red", "yellow", "blue"])
+
+        chart=(alt.Chart(df_all).mark_line().encode(x=alt.X("index:Q", title="Sample Index"), y=alt.Y("value:Q", title="Slope Degrees"), color=alt.Color("color_group:N", scale=color_scale, title="Legend"), detail="rank:N", tooltip=["rank", "index", "value"], ).properties(width=900, height=400))
+
+        st.altair_chart(chart, use_container_width=True)
 
     if candidates:
         st.markdown("### Top 10 candidates")
         table_df = pd.DataFrame(candidates)
         keep_cols = ["rank", "score", "lat", "lon", "heading_deg"]
         st.dataframe(table_df[keep_cols], use_container_width=True)
+

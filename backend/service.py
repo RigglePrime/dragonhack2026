@@ -28,7 +28,7 @@ class AnalyzeRequest(BaseModel):
         default=None,
         description="Company name used in Gemini prompt. Defaults to symbol.",
     )
-    spacing_m: float = 25.0
+    spacing_m: float = 100.0
     headings: int = 12
     random_samples: int = 300
     top_k: int = 20
@@ -37,6 +37,36 @@ class AnalyzeRequest(BaseModel):
 
 
 app = FastAPI(title="Terrain Vibe Service", version="1.0.0")
+
+
+def resolve_symbol(query: str) -> str:
+    """
+    Accepts either a ticker (AAPL) or a company name (Apple).
+    Returns the best matching ticker symbol.
+    """
+    import yfinance as yf
+
+    query = query.strip()
+    if not query:
+        raise ValueError("Empty symbol or company name")
+
+    # If user already typed a ticker, try it directly
+    try:
+        test = yf.Ticker(query).history(period="1d")
+        if not test.empty:
+            return query.upper()
+    except Exception:
+        pass
+
+    # Otherwise search by company name
+    try:
+        results = yf.search(query)
+        if results and "symbol" in results[0]:
+            return results[0]["symbol"].upper()
+    except Exception:
+        pass
+
+    raise ValueError(f"Could not resolve '{query}' to a stock ticker")
 
 def _compute_bounds(points: list[dict[str, float]]) -> dict:
     lats = [p["lat"] for p in points]
@@ -59,6 +89,8 @@ def _candidate_to_dict(candidate: CoordinateCandidate) -> dict:
         "lat": candidate.lat,
         "lon": candidate.lon,
         "route": [{"lat": lat, "lon": lon} for lat, lon in candidate.route_latlon],
+        "terrain_profile":candidate.terrain_profile
+
     }
 
 
@@ -95,7 +127,8 @@ def health() -> dict:
 
 @app.post("/api/analyze")
 def analyze(request: AnalyzeRequest) -> dict:
-    symbol = request.symbol.strip().upper()
+    symbol = resolve_symbol(request.symbol)
+
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol must not be empty")
 
@@ -142,6 +175,8 @@ def analyze(request: AnalyzeRequest) -> dict:
     selected_rank = gemini.chosen_rank
     selected = next((c for c in candidate_payload if c["rank"] == selected_rank), candidate_payload[0])
     # --- MAP BOUNDS ---
+    # NEW: include terrain profile for selected candidate
+    selected_profile=selected.get("terrain_profile", [])
 
     # Zoomed-out: all candidate points
     zoomed_out_bounds=_compute_bounds(candidate_payload)
@@ -162,5 +197,9 @@ def analyze(request: AnalyzeRequest) -> dict:
             "used_fallback": gemini.used_fallback,
         },
         "selected_candidate": selected,
-        "route": selected.get("route", []), "maps":{"zoomed_out":{"bounds":zoomed_out_bounds, "points":[{"lat":c["lat"], "lon":c["lon"], "rank":c["rank"]} for c in candidate_payload], }, "zoomed_in":{"bounds":zoomed_in_bounds, "route":selected.get("route", []), }, },
+        "route": selected.get("route", []),
+        "maps":{"zoomed_out":{"bounds":zoomed_out_bounds, "points":[{"lat":c["lat"], "lon":c["lon"], "rank":c["rank"]} for c in candidate_payload], },
+                "zoomed_in":{"bounds":zoomed_in_bounds, "route":selected.get("route", []), }, },
+        "terrain_profile":selected.get("terrain_profile", []),
+
     }
