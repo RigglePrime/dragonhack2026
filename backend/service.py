@@ -29,6 +29,7 @@ class AnalyzeRequest(BaseModel):
         description="Company name used in Gemini prompt. Defaults to symbol.",
     )
     spacing_m: float = 100.0
+    path_mode: Literal["straight", "astar"] = "astar"
     headings: int = 12
     random_samples: int = 500
     top_k: int = 10
@@ -154,6 +155,7 @@ def analyze(request: AnalyzeRequest) -> dict:
             map_path=map_path,
             top_n=10,
             spacing_m=request.spacing_m,
+            path_mode=request.path_mode,
             headings=request.headings,
             random_samples=request.random_samples,
             top_k=request.top_k,
@@ -187,6 +189,7 @@ def analyze(request: AnalyzeRequest) -> dict:
     return {
         "symbol": symbol,
         "window": request.window,
+        "path_mode": request.path_mode,
         "company": company,
         "series": series,
         "candidates": candidate_payload,

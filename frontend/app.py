@@ -199,6 +199,13 @@ with right:
         help="Choose whether to use last day, week, or month of price history.",
     )
 
+path_mode = st.selectbox(
+    "Path mode",
+    options=["astar", "straight"],
+    index=0,
+    help="Use A* for non-straight route estimation or straight-line baseline.",
+)
+
 company_override = st.text_input(
     "Company vibe label (optional)",
     placeholder="If empty, symbol is used in the Gemini prompt.",
@@ -223,6 +230,7 @@ if run_now:
         payload = {
             "symbol": symbol_clean,
             "window": window,
+            "path_mode": path_mode,
             "spacing_m": spacing_m,
             "headings": headings,
             "random_samples": random_samples,
@@ -290,7 +298,9 @@ if result:
             st_folium(fmap_in, width=600, height=500)
         else:
             st.info("Zoomed‑in map not available.")
-    st.subheader(f"Symbol: {result['symbol']} ({result['window']})")
+    st.subheader(
+        f"Symbol: {result['symbol']} ({result['window']}) [path: {result.get('path_mode', 'n/a')}]"
+    )
     series_df=pd.DataFrame(result["series"])
     if not series_df.empty:
         series_df["time"] = pd.to_datetime(series_df["time"])
