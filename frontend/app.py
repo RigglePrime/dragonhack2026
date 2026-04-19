@@ -11,8 +11,8 @@ from streamlit_folium import st_folium
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
-st.set_page_config(page_title="Stock Terrain Vibes", layout="wide")
-st.title("Stock Terrain Vibes")
+st.set_page_config(page_title="Take a Hike!", layout="wide")
+st.title("Take a Hike!")
 st.caption("Yahoo Finance -> Terrain Matching -> Gemini Pick -> OpenStreetMap")
 
 
@@ -205,7 +205,7 @@ company_override = st.text_input(
 )
 
 with st.expander("Advanced matching options"):
-    spacing_m = st.number_input("Spacing meters", min_value=1.0, value=25.0, step=1.0)
+    spacing_m = st.number_input("Spacing meters", min_value=1.0, value=100.0, step=1.0)
     headings = st.slider("Heading hypotheses", min_value=4, max_value=36, value=12)
     random_samples = st.slider("Random samples", min_value=50, max_value=2000, value=300, step=50)
     top_k = st.slider("Top-k coarse candidates", min_value=10, max_value=100, value=20, step=5)
@@ -304,13 +304,41 @@ if result:
 
         st.line_chart(normalized, use_container_width=True)
         #st.line_chart(series_df.set_index("time")["close"], use_container_width=True)
-    if terrain_profile:
-        st.markdown("### Terrain Height Profile (Slope Degrees)")
-        profile_df=pd.DataFrame({"index":list(range(len(terrain_norm))), "terrain_norm":terrain_norm}).set_index("index")
-
-        st.line_chart(profile_df, use_container_width=True)
-
     import altair as alt
+
+    if candidates and terrain_profile:
+        st.markdown("### Terrain Height Profile (Chosen vs Rank #1)")
+
+        chosen_rank=selected["rank"]
+        first_rank=1
+
+        # --- Extract profiles ---
+        chosen_profile=None
+        first_profile=None
+
+        for c in candidates:
+            if c["rank"]==chosen_rank:
+                chosen_profile=c.get("terrain_profile", [])
+            if c["rank"]==first_rank:
+                first_profile=c.get("terrain_profile", [])
+
+        if chosen_profile and first_profile:
+            # --- Min–max normalize both ---
+            chosen_norm=(pd.Series(chosen_profile)-min(chosen_profile))/(max(chosen_profile)-min(chosen_profile))
+            first_norm=(pd.Series(first_profile)-min(first_profile))/(max(first_profile)-min(first_profile))
+
+            # --- Build dataframe ---
+            df=pd.DataFrame({"index":range(len(chosen_norm)), "chosen":chosen_norm, "first":first_norm, })
+
+            # --- Melt for Altair ---
+            df_melt=df.melt("index", var_name="series", value_name="value")
+
+            # --- Color mapping ---
+            color_scale=alt.Scale(domain=["chosen", "first"], range=["red", "yellow"])
+
+            chart=(alt.Chart(df_melt).mark_line(strokeWidth=3).encode(x=alt.X("index:Q", title="Sample Index"), y=alt.Y("value:Q", title="Normalized Slope"), color=alt.Color("series:N", scale=color_scale, title="Legend"), tooltip=["series", "index", "value"], ).properties(width=900, height=400))
+
+            st.altair_chart(chart, use_container_width=True)
 
     if candidates:
         st.markdown("### All Terrain Profiles (Chosen in Red, Rank #1 in Yellow)")
