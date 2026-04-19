@@ -25,7 +25,7 @@ def _build_prompt(company: str, places: list[dict[str, Any]]) -> str:
     coordinate_block = "\n".join(lines)
 
     return (
-        f"Here are 10 coordinates of places. Pick the one that fits the vibe of {company} best. Ignore the similarity score, take into account company data, what they do, where they are located etc. Write an elaborate explanation for this choice.\n\n"
+        f"Here are 10 coordinates of places. Pick the one that fits the vibe of {company} best. Ignore the similarity score, take into account company data, what they do, where they are located etc. Write an elaborate explanation for this choice. make it fast as well, you have 30 seconds to process.\n\n"
         "Return strict JSON with this schema: "
         '{"chosen_rank": <integer 1-10>, "reason": <short string>} and nothing else.\n\n'
         f"Coordinates:\n{coordinate_block}\n"

@@ -18,6 +18,95 @@ st.caption("Yahoo Finance -> Terrain Matching -> Gemini Pick -> OpenStreetMap")
 if "analysis_result" not in st.session_state:
     st.session_state.analysis_result = None
 
+def _render_zoomed_out_map(zoomed_out: dict, selected_route: list[dict], selected_rank: int | None) -> folium.Map:
+    bounds = zoomed_out["bounds"]
+    points = zoomed_out["points"]
+
+    center_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2
+    center_lon = (bounds["min_lon"] + bounds["max_lon"]) / 2
+
+    fmap = folium.Map(location=[center_lat, center_lon], zoom_start=4, tiles="OpenStreetMap")
+
+    # --- 1. Draw all NON-selected points first ---
+    for p in points:
+        if p["rank"] == selected_rank:
+            continue  # skip selected for now
+
+        folium.CircleMarker(
+            location=[p["lat"], p["lon"]],
+            radius=5,
+            color="blue",
+            fill=True,
+            fill_opacity=0.85,
+            popup=f"Rank {p['rank']}",
+        ).add_to(fmap)
+
+    # --- 2. Draw the SELECTED point last (so it appears on top) ---
+    if selected_rank is not None:
+        selected = next((p for p in points if p["rank"] == selected_rank), None)
+        if selected:
+            folium.CircleMarker(
+                location=[selected["lat"], selected["lon"]],
+                radius=8,
+                color="red",
+                fill=True,
+                fill_opacity=1.0,
+                popup=f"Rank {selected['rank']} (chosen)",
+            ).add_to(fmap)
+
+    # --- 3. Highlight selected route (thin + subtle) ---
+    if selected_route:
+        folium.PolyLine(
+            locations=[(p["lat"], p["lon"]) for p in selected_route],
+            color="red",
+            weight=2,
+            opacity=0.6,
+        ).add_to(fmap)
+
+    # Fit bounds
+    fmap.fit_bounds([
+        [bounds["min_lat"], bounds["min_lon"]],
+        [bounds["max_lat"], bounds["max_lon"]],
+    ])
+
+    return fmap
+
+
+
+def _render_zoomed_in_map(zoomed_in: dict) -> folium.Map:
+    bounds = zoomed_in["bounds"]
+    route = zoomed_in["route"]
+
+    # Add padding (5% of span)
+    lat_pad = (bounds["max_lat"] - bounds["min_lat"]) * 0.05
+    lon_pad = (bounds["max_lon"] - bounds["min_lon"]) * 0.05
+
+    padded_bounds = [
+        [bounds["min_lat"] - lat_pad, bounds["min_lon"] - lon_pad],
+        [bounds["max_lat"] + lat_pad, bounds["max_lon"] + lon_pad],
+    ]
+
+    center_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2
+    center_lon = (bounds["min_lon"] + bounds["max_lon"]) / 2
+
+    fmap = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles="OpenStreetMap")
+
+    # Draw route
+    if route:
+        folium.PolyLine(
+            locations=[(p["lat"], p["lon"]) for p in route],
+            color="red",
+            weight=4,
+            opacity=0.85,
+        ).add_to(fmap)
+
+        folium.Marker([route[0]["lat"], route[0]["lon"]], popup="Start").add_to(fmap)
+        folium.Marker([route[-1]["lat"], route[-1]["lon"]], popup="End").add_to(fmap)
+
+    # Fit padded bounds
+    fmap.fit_bounds(padded_bounds)
+
+    return fmap
 
 def _render_map(candidates: list[dict], selected_candidate: dict | None, route: list[dict]) -> folium.Map:
     if selected_candidate is not None:
@@ -142,9 +231,29 @@ if result:
     selected = result.get("selected_candidate")
     route = result.get("route", [])
 
-    st.markdown("### Map")
-    fmap = _render_map(candidates=candidates, selected_candidate=selected, route=route)
-    st_folium(fmap, width=1200, height=520)
+    st.markdown("### Maps")
+
+    maps=result.get("maps", {})
+
+    col1, col2=st.columns(2)
+
+    with col1:
+        st.markdown("#### 🌍 Zoomed‑out (all candidates + highlighted route)")
+        if "zoomed_out" in maps:
+            selected_rank=selected["rank"] if selected else None
+            fmap_out=_render_zoomed_out_map(maps["zoomed_out"], route, selected_rank)
+
+            st_folium(fmap_out, width=600, height=500)
+        else:
+            st.info("Zoomed‑out map not available.")
+
+    with col2:
+        st.markdown("#### 🗺️ Zoomed‑in (selected route, slightly zoomed out)")
+        if "zoomed_in" in maps:
+            fmap_in=_render_zoomed_in_map(maps["zoomed_in"])
+            st_folium(fmap_in, width=600, height=500)
+        else:
+            st.info("Zoomed‑in map not available.")
 
     if candidates:
         st.markdown("### Top 10 candidates")

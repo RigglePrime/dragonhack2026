@@ -38,7 +38,15 @@ class AnalyzeRequest(BaseModel):
 
 app = FastAPI(title="Terrain Vibe Service", version="1.0.0")
 
-
+def _compute_bounds(points: list[dict[str, float]]) -> dict:
+    lats = [p["lat"] for p in points]
+    lons = [p["lon"] for p in points]
+    return {
+        "min_lat": min(lats),
+        "max_lat": max(lats),
+        "min_lon": min(lons),
+        "max_lon": max(lons),
+    }
 def _candidate_to_dict(candidate: CoordinateCandidate) -> dict:
     return {
         "rank": candidate.rank,
@@ -133,6 +141,13 @@ def analyze(request: AnalyzeRequest) -> dict:
 
     selected_rank = gemini.chosen_rank
     selected = next((c for c in candidate_payload if c["rank"] == selected_rank), candidate_payload[0])
+    # --- MAP BOUNDS ---
+
+    # Zoomed-out: all candidate points
+    zoomed_out_bounds=_compute_bounds(candidate_payload)
+
+    # Zoomed-in: only the selected route
+    zoomed_in_bounds=_compute_bounds(selected.get("route", []))
 
     return {
         "symbol": symbol,
@@ -147,5 +162,5 @@ def analyze(request: AnalyzeRequest) -> dict:
             "used_fallback": gemini.used_fallback,
         },
         "selected_candidate": selected,
-        "route": selected.get("route", []),
+        "route": selected.get("route", []), "maps":{"zoomed_out":{"bounds":zoomed_out_bounds, "points":[{"lat":c["lat"], "lon":c["lon"], "rank":c["rank"]} for c in candidate_payload], }, "zoomed_in":{"bounds":zoomed_in_bounds, "route":selected.get("route", []), }, },
     }
