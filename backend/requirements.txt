@@ -6,3 +6,4 @@ pyproj
 requests
 yfinance
 typer
+google-genai

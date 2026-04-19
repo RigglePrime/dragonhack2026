@@ -1,5 +1,7 @@
 numpy
-requests
+requests~=2.33.1
 typer
 rasterio
 pillow
+google-genai
+pydantic~=2.13.2

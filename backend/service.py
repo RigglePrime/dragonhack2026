@@ -143,7 +143,6 @@ def analyze(request: AnalyzeRequest) -> dict:
         "gemini": {
             "chosen_rank": gemini.chosen_rank,
             "reason": gemini.reason,
-            "model": gemini.model,
             "raw_text": gemini.raw_text,
             "used_fallback": gemini.used_fallback,
         },
