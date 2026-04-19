@@ -3,7 +3,7 @@ services:
     build:
       context: ./backend
     env_file:
-      - ./backend/.env
+      - .env
     environment:
       - TERRAIN_MAP_PATH=/data/eudem_slop_3035_europe.tif
     volumes:

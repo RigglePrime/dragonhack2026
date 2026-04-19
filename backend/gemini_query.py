@@ -5,30 +5,16 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any
-
+from google import genai
+from google.genai import types
 import requests
-
-GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
-
 
 @dataclass(frozen=True)
 class GeminiSelection:
     chosen_rank: int
     reason: str
-    model: str
     raw_text: str
     used_fallback: bool
-
-
-def _get_gemini_api_key() -> str | None:
-    for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        value = os.getenv(key)
-        if value and value.strip():
-            return value.strip()
-    return None
-
-
 def _build_prompt(company: str, places: list[dict[str, Any]]) -> str:
     lines = [
         f"{place['rank']}. lat={place['lat']:.6f}, lon={place['lon']:.6f} (score={place['score']:.4f})"
@@ -88,27 +74,16 @@ def _parse_rank_and_reason(raw_text: str, max_rank: int) -> tuple[int, str]:
 def choose_coordinate(
     company: str,
     places: list[dict[str, Any]],
-    model: str = DEFAULT_GEMINI_MODEL,
     timeout: int = 30,
 ) -> GeminiSelection:
     if not places:
         return GeminiSelection(
             chosen_rank=1,
             reason="No candidates available.",
-            model=model,
             raw_text="",
             used_fallback=True,
         )
 
-    api_key = _get_gemini_api_key()
-    if not api_key:
-        return GeminiSelection(
-            chosen_rank=1,
-            reason="GEMINI_API_KEY is missing; defaulted to first candidate.",
-            model=model,
-            raw_text="",
-            used_fallback=True,
-        )
 
     prompt = _build_prompt(company=company, places=places)
     payload = {
@@ -118,23 +93,23 @@ def choose_coordinate(
             "maxOutputTokens": 256,
         },
     }
-
-    url = f"{GEMINI_API_BASE}/{model}:generateContent"
     try:
-        response = requests.post(
-            url,
-            params={"key": api_key},
-            json=payload,
-            timeout=timeout,
-        )
-        response.raise_for_status()
+        client=genai.Client(api_key="")
+
+        #value=os.getenv("GEMINI_API_KEY")
+        #print(value)
+
+        response=client.models.generate_content(model="gemini-3-flash-preview", contents=_build_prompt())
+
+        print(response.text)
+
+        #response.raise_for_status()
         data = response.json()
         raw_text = _extract_text_from_response(data)
         rank, reason = _parse_rank_and_reason(raw_text, max_rank=len(places))
         return GeminiSelection(
             chosen_rank=rank,
             reason=reason,
-            model=model,
             raw_text=raw_text,
             used_fallback=False,
         )
@@ -142,7 +117,6 @@ def choose_coordinate(
         return GeminiSelection(
             chosen_rank=1,
             reason=f"Gemini request failed: {exc}. Defaulted to first candidate.",
-            model=model,
             raw_text="",
             used_fallback=True,
         )
