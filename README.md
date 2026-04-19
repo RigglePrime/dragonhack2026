@@ -53,16 +53,31 @@ and frontend request timing so you can trace a full analyze run end-to-end.
 
 ## Run With Docker Compose
 
-From repository root:
+The repository now uses a base compose template plus environment-specific overrides:
+
+- `docker-compose.yaml`: shared template (backend, frontend, nginx; no exposed nginx port)
+- `docker-compose.nginx.yaml`: exposes nginx on host port 80
+- `docker-compose.cf-tunnel.yaml`: adds Cloudflare Tunnel service (nginx stays internal-only)
+
+Nginx on port 80:
 
 ```bash
-docker compose up --build
+docker compose -f docker-compose.yaml -f docker-compose.nginx.yaml up --build
 ```
 
 Then open:
 
 - App UI: `http://localhost/`
 - Health: `http://localhost/health`
+
+Cloudflare Tunnel variant:
+
+```bash
+CF_TUNNEL_TOKEN=your_tunnel_token \
+docker compose -f docker-compose.yaml -f docker-compose.cf-tunnel.yaml up --build
+```
+
+For the Cloudflare variant, do not expose host ports from nginx; traffic reaches nginx through `cloudflared` on the internal Docker network.
 
 Example API call through Nginx:
 
