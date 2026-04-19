@@ -201,7 +201,7 @@ with right:
 
 path_mode = st.selectbox(
     "Path mode",
-    options=["astar", "straight"],
+    options=["straight", "astar"],
     index=0,
     help="Use A* for non-straight route estimation or straight-line baseline.",
 )

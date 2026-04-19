@@ -29,7 +29,7 @@ class AnalyzeRequest(BaseModel):
         description="Company name used in Gemini prompt. Defaults to symbol.",
     )
     spacing_m: float = 100.0
-    path_mode: Literal["straight", "astar"] = "astar"
+    path_mode: Literal["straight", "astar"] = "straight"
     headings: int = 12
     random_samples: int = 500
     top_k: int = 10
