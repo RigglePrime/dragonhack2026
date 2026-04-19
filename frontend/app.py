@@ -123,7 +123,15 @@ if result:
     if not series_df.empty:
         series_df["time"] = pd.to_datetime(series_df["time"])
         series_df = series_df.sort_values("time")
-        st.line_chart(series_df.set_index("time")["close"], use_container_width=True)
+        df = series_df.set_index("time")
+
+        close = df["close"]
+
+        # Min–max normalization
+        normalized = (close - close.min()) / (close.max() - close.min())
+
+        st.line_chart(normalized, use_container_width=True)
+        #st.line_chart(series_df.set_index("time")["close"], use_container_width=True)
 
     gemini = result.get("gemini", {})
     st.markdown("### Gemini pick")

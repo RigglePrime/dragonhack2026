@@ -5,3 +5,4 @@ rasterio
 pyproj
 requests
 yfinance
+typer
