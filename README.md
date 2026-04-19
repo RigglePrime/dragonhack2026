@@ -1,6 +1,8 @@
-# Stock Terrain Vibes
+# Take-a-Hike
 
-Stock Terrain Vibes maps stock-price behavior to real terrain patterns across Europe.
+Take-a-Hike maps stock-price behavior to real terrain patterns across Europe.
+
+Have you ever wondered what stocks come to life would look like in a healthy way? Have you ever wanted to retrace the steps of your portfolio? Now you can! With Take-a-Hike you can pick your favourite stock and it will automatically calculate several paths in the world that have similar relief as the stock of your choice. Take-a-Hike can make you take a hike and explore the world!
 
 Pipeline:
 1. User enters a ticker and selects a time window (`1d`, `1w`, `1mo`).
@@ -9,7 +11,7 @@ Pipeline:
 4. Backend sends the top 10 candidate coordinates to Gemini with prompt:
 	 `Here are 10 coordinates of places. Pick the one that fits the vibe of [COMPANY] best.`
 5. Backend returns the Gemini-selected candidate and route.
-6. Frontend plots the stock series, top candidates, and selected route on OpenStreetMap.
+6. Frontend plots the stock series, top candidates, their comparison with the stock, and selected route on OpenStreetMap.
 
 ## Architecture
 
@@ -37,7 +39,7 @@ Only Nginx exposes a host port. Backend and frontend are internal to the Docker 
 
 Create/update `backend/.env` with:
 
-- `GEMINI_API_KEY=...` (or `GOOGLE_API_KEY=...`) for Gemini selection
+- `GEMINI_API_KEY=...` for Gemini selection
 - `TERRAIN_MAP_PATH` is set by compose to `/data/eudem_slop_3035_europe.tif`
 
 Notes:
