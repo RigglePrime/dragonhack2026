@@ -1,7 +1,6 @@
 services:
   backend:
-    build:
-      context: ./backend
+    image: ghcr.io/riggleprime/dragonhack2026-backend:sha-1a89cd9
     env_file:
       - backend/.env
     environment:
@@ -10,8 +9,7 @@ services:
       - ./backend/eud_cp_slop:/data:ro
 
   frontend:
-    build:
-      context: ./frontend
+    image: ghcr.io/riggleprime/dragonhack2026-frontend:sha-1a89cd9
     environment:
       - BACKEND_URL=http://backend:8000
     depends_on:
